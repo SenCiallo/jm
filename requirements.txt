@@ -1,0 +1,6 @@
+# JMComic 每日自动签到 —— 运行依赖
+#
+# jmcomic 2.7.7 已声明下列运行时依赖，pip 会自动安装：
+#   commonx>=0.6.38, curl-cffi, pillow, pycryptodome, pyyaml
+# 本项目只依赖 jmcomic 本身，其余保持由 jmcomic 决定版本。
+jmcomic==2.7.7
