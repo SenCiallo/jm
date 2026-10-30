@@ -42,6 +42,9 @@ jobs:
       # 可选：代理（Repository secret）
       JM_PROXY: ${{ secrets.JM_PROXY }}
       JM_RETRY_TIMES: '3'
+      # 可选：客户端实现。api（默认，移动端 API）| html（网页端，签到走明文 JSON 接口）
+      # 若 /daily_chk 连续返回空 data 导致一直 pending，可改为 html 兜底。
+      JM_CLIENT_IMPL: ${{ vars.JM_CLIENT_IMPL || 'api' }}
 
     steps:
       - name: Checkout

@@ -164,6 +164,29 @@ class AlreadyCheckedIn(Exception):
     """今日已签到：服务端的幂等结果，不是错误。"""
 
 
+class ServerEmptyData(Exception):
+    """服务端返回空 data（形如 ``{"code":200,"data":[]}``）。
+
+    禁漫接口高峰期偶发：HTTP 200、``code`` 也是 200，但 ``data`` 是空数组而不是
+    加密的 Base64 密文。jmcomic 2.7.7 ~ 2.7.10 的 ``JmApiResp.decoded_data`` 会把
+    list 直接丢给 ``base64.b64decode``，抛出::
+
+        TypeError: argument should be a bytes-like object or ASCII string, not 'list'
+
+    这是服务端瞬时抽风，不是账号或代码问题，重试即可恢复；重试仍失败时按
+    「稍后重试」而非「签到失败」上报，避免误判成账号异常。
+    """
+
+
+def is_server_empty_data(message: str) -> bool:
+    """识别 jmcomic 把空 data 塞进 base64.b64decode 产生的 TypeError。"""
+    text = str(message)
+    return (
+        "argument should be a bytes-like object or ASCII string" in text
+        and "'list'" in text
+    )
+
+
 # 服务端可能用简体或繁体返回“已签到”，而 jmcomic 2.7.7 只内置了部分繁体关键词，
 # 这里做一次简繁兜底识别，避免重复运行时误报失败。
 ALREADY_SIGNED_KEYWORDS = (
@@ -242,18 +265,65 @@ def load_jmcomic(reporter: Reporter):
         raise SystemExit(EXIT_CONFIG)
 
     reporter.info(f"jmcomic 版本: {getattr(jmcomic, '__version__', 'unknown')}")
+    _patch_jmcomic(jmcomic, reporter)
     return JmOption, JmDailyCheckinResp, ProxyBuilder
+
+
+def _patch_jmcomic(jmcomic_mod, reporter: Reporter) -> None:
+    """在库层面兜住「/daily_chk 返回空 data」的裸 base64 崩溃。
+
+    jmcomic 2.7.7 ~ 2.7.10 的 ``JmApiResp.encoded_data`` 直接返回 ``json()['data']``，
+    当服务端给 ``[]`` 时，``decoded_data`` 会把 list 传给 ``base64.b64decode`` 抛
+    TypeError。这里替换 ``JmApiResp.res_data``，在解码前先做类型判断，抛出可读的
+    ServerEmptyData。
+    """
+    try:
+        from jmcomic import JmApiResp
+    except Exception as exc:  # pragma: no cover
+        reporter.warn(f"跳过 jmcomic 兼容补丁（导入 JmApiResp 失败）: {exc}")
+        return
+
+    if getattr(JmApiResp, "_lcs_patched", False):
+        return
+
+    original_res_data = JmApiResp.res_data
+
+    def res_data(self):
+        try:
+            encoded = self.encoded_data
+        except Exception:
+            return original_res_data.__get__(self, type(self))
+        if isinstance(encoded, list):
+            if len(encoded) == 0:
+                raise ServerEmptyData(
+                    "服务端返回空 data（{\"code\":200,\"data\":[]}），接口瞬时不可用"
+                )
+            raise ServerEmptyData(f"服务端 data 为非预期数组: {encoded!r}")
+        if not isinstance(encoded, str):
+            raise ServerEmptyData(f"服务端 data 类型异常: {type(encoded).__name__}")
+        return original_res_data.__get__(self, type(self))
+
+    JmApiResp.res_data = property(res_data)
+    JmApiResp._lcs_patched = True
+    reporter.info("已启用 jmcomic 空 data 兼容补丁")
 
 
 def build_client(option_cls, proxy_builder, retry_times: int, reporter: Reporter):
     """按约定构造客户端：JmOption.construct({...}).build_jm_client()，impl 固定为 api。"""
+    # 默认走移动端 API 客户端（JmApiClient）。若 /daily_chk 长期抽风，可设
+    # JM_CLIENT_IMPL=html 切到网页端客户端（签到走 POST /ajax/user_daily_sign，
+    # 返回明文 JSON，不经 base64/AES 解码，对空 data 免疫）。
+    impl = (os.getenv("JM_CLIENT_IMPL") or "api").strip().lower() or "api"
+
     conf: Dict[str, Any] = {
         "log": os.getenv("JM_LOG", "1") not in ("0", "false", "False"),
         "client": {
-            "impl": "api",                 # 移动端 API 客户端 -> JmApiClient
+            "impl": impl,                  # api -> JmApiClient / html -> JmHtmlClient
             "retry_times": retry_times,    # 单个请求的域名/网络重试次数
         },
     }
+    if impl != "api":
+        reporter.info(f"客户端实现: {impl}")
 
     domains = parse_domains(os.getenv("JM_API_DOMAINS"))
     if domains:
@@ -307,7 +377,10 @@ def step_fetch_daily(client, user_id: Optional[str], retry_times: int, reporter:
 
     daily_id = data.get("daily_id")
     if not daily_id:
-        raise RuntimeError(f"签到信息缺少 daily_id: {data}")
+        # 服务端偶发不返回 daily_id（活动切换/接口抽风）。此时日历信息仍然可用，
+        # 不应直接把整条流水线判红，交给 run() 结合日历决定 pending / already。
+        reporter.warn(f"签到信息缺少 daily_id，跳过打卡请求: {data}")
+        return data, None
 
     reporter.info(
         f"当前签到活动: {data.get('event_name', '?')} "
@@ -353,6 +426,12 @@ def step_checkin(client, daily_id: Any, user_id: Optional[str], checkin_resp_cls
             # 这里统一转成 AlreadyCheckedIn，按幂等成功处理。
             if is_already_checked_in(str(exc)):
                 raise AlreadyCheckedIn(str(exc)) from exc
+            # /daily_chk 返回 {"code":200,"data":[]} 时库内部会裸 b64decode(list)，
+            # 转成明确的可重试异常，避免日志里出现难以理解的 TypeError。
+            if is_server_empty_data(str(exc)):
+                raise ServerEmptyData(
+                    "服务端返回空 data（{\"code\":200,\"data\":[]}），签到接口瞬时不可用"
+                ) from exc
             raise
 
     try:
@@ -360,6 +439,10 @@ def step_checkin(client, daily_id: Any, user_id: Optional[str], checkin_resp_cls
     except AlreadyCheckedIn as exc:
         reporter.info(f"今日已签到，无需重复操作 ({exc})")
         return None, "already"
+    except ServerEmptyData as exc:
+        # 重试耗尽仍然是空 data：服务端抽风，按「稍后重试」处理，不算账号问题。
+        reporter.warn(f"签到接口连续返回空数据，本次跳过: {exc}")
+        return None, "pending"
 
     code = getattr(result, "code", None)
     msg = getattr(result, "msg", "") or ""
@@ -427,12 +510,31 @@ def run(args, reporter: Reporter = REPORTER) -> SigninResult:
             result.message = "服务端日历显示今日已签到"
             reporter.group("步骤 3/3 执行签到")
             reporter.info("服务端日历显示今日已签到，跳过打卡请求（加 --force 可强制调用）")
+        elif not daily_id:
+            # 拿不到 daily_id：无法发起打卡，按 pending 处理（日历已签则视为完成）
+            reporter.group("步骤 3/3 执行签到")
+            checkin_result, status = None, "pending"
+            reporter.warn("缺少 daily_id，本次未发起打卡请求")
+            result.status = status
+            result.message = "服务端未返回 daily_id，未发起打卡请求"
         else:
             checkin_result, status = step_checkin(
                 client, daily_id, result.uid or None, checkin_resp_cls, retry_times, reporter
             )
+            if status == "pending":
+                # 打卡接口抽风，但服务端日历可信：今日已签则视为完成，否则记为稍后重试。
+                if result.today_signed:
+                    status = "already"
+                    reporter.info("打卡接口异常，但服务端日历显示今日已签到，按已完成处理。")
+                else:
+                    reporter.warn(
+                        "打卡接口异常且日历显示今日未签到；本次未完成，等待下一次定时任务重试。"
+                    )
             result.status = status
-            result.message = getattr(checkin_result, "msg", "") or status
+            if status == "pending":
+                result.message = "服务端签到接口连续返回空数据（HTTP 200 但 data=[]）"
+            else:
+                result.message = getattr(checkin_result, "msg", "") or status
 
     except SystemExit:
         raise
@@ -447,10 +549,13 @@ def run(args, reporter: Reporter = REPORTER) -> SigninResult:
 
 
 def write_summary(reporter: Reporter, result: SigninResult) -> None:
-    icon = {"success": "OK", "already": "SKIP", "failed": "FAIL"}.get(result.status, "?")
+    icon = {"success": "OK", "already": "SKIP", "pending": "WAIT", "failed": "FAIL"}.get(
+        result.status, "?"
+    )
     title = {
         "success": "签到成功",
         "already": "今日已签到",
+        "pending": "服务端异常，等待下次重试",
         "failed": "签到失败",
     }.get(result.status, result.status)
 
@@ -489,7 +594,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true",
                         help="即使日历显示今日已签到，也强制调用一次打卡接口")
     parser.add_argument("-q", "--quiet", action="store_true", help="只输出警告和错误")
-    parser.add_argument("--version", action="version", version="%(prog)s (jmcomic 2.7.7)")
+    parser.add_argument("--version", action="version", version="%(prog)s (jmcomic 2.7.7+)")
     return parser
 
 
@@ -504,6 +609,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if result.status == "failed":
         REPORTER.error(f"{PROJECT_NAME} 失败")
         return EXIT_FAILED
+
+    if result.status == "pending":
+        REPORTER.warn(f"{PROJECT_NAME} 未完成：服务端签到接口异常，等待下次定时任务重试")
+        return EXIT_OK
 
     REPORTER.info(f"{PROJECT_NAME} 完成，状态: {result.status}")
     return EXIT_OK
